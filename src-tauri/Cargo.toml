@@ -1,0 +1,34 @@
+[package]
+name = "ai-usage-tray"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+walkdir = "2"
+reqwest = { version = "0.12", features = ["blocking"] }
+dirs = "5"
+rusqlite = { version = "0.31", features = ["bundled"] }
+tokio = { version = "1", features = ["time"] }
+
+[dev-dependencies]
+tempfile = "3"
+filetime = "0.2"
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
