@@ -117,6 +117,8 @@
     td.name { color: var(--text); max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     td.num { text-align: right; color: var(--muted); padding-left: 10px; white-space: nowrap; }
 
+    .trend .sparkline { width: 100%; height: 32px; display: block; color: var(--accent); }
+
     .empty { text-align: center; color: var(--muted); padding: 40px 20px; }
 
     footer {
@@ -315,6 +317,9 @@
       html += `<div class="tiles">
         ${tile("Hoy", agent.today)}${tile("Mes", agent.month)}${tile("7 días", agent.week)}
       </div>`;
+      if (agent.trend_svg) {
+        html += `<div class="card trend"><h4>Últimos 30 días</h4>${agent.trend_svg}</div>`;
+      }
       html += breakdownCard("Por proyecto", agent.by_project);
       html += breakdownCard("Por modelo", agent.by_model);
       content.innerHTML = html;

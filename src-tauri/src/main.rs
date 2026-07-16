@@ -3,6 +3,7 @@
 mod cache;
 mod claude_oauth;
 mod dashboard;
+mod history;
 mod limits;
 mod menu_format;
 mod model;
@@ -46,6 +47,11 @@ pub struct AppState {
     /// Last dashboard payload, served to the panel when it (re)opens.
     /// `None` until the first scan finishes.
     pub dashboard: Mutex<Option<DashboardPayload>>,
+    /// App-owned daily history (tokens/cost per day per agent), used for
+    /// trend sparklines. `None` when `history.db` couldn't be opened —
+    /// trends are then simply absent, same as any other degrade-in-silence
+    /// failure in this app.
+    pub history: Mutex<Option<rusqlite::Connection>>,
 }
 
 fn claude_projects_dir() -> std::path::PathBuf {
@@ -73,6 +79,10 @@ fn opencode_db_path() -> std::path::PathBuf {
 
 fn config_dir() -> std::path::PathBuf {
     dirs::config_dir().expect("config dir must resolve").join("ai-usage-tray")
+}
+
+fn history_db_path() -> std::path::PathBuf {
+    config_dir().join("history.db")
 }
 
 /// Pricing changes rarely; refresh at most daily, retrying hourly after a
@@ -119,6 +129,18 @@ pub fn refresh_all(app: &AppHandle) {
     }
     let pricing = state.pricing.lock().unwrap().clone();
 
+    {
+        let history_guard = state.history.lock().unwrap();
+        if let Some(conn) = history_guard.as_ref() {
+            if !history::is_backfilled(conn) {
+                for (agent, events, _) in &gathered {
+                    history::backfill(conn, events, *agent, &pricing);
+                }
+                history::mark_backfilled(conn, now);
+            }
+        }
+    }
+
     let sections: Vec<AgentSection> = gathered
         .into_iter()
         .filter_map(|(agent, events, limits)| {
@@ -131,7 +153,32 @@ pub fn refresh_all(app: &AppHandle) {
         summary::total_unpriced_this_month(sections.iter().map(|s| &s.summary));
     *state.unpriced_count.lock().unwrap() = unpriced_count;
 
-    let payload = dashboard::build_payload(&sections, now);
+    let trends: std::collections::HashMap<Agent, Vec<history::TrendPoint>> = {
+        let history_guard = state.history.lock().unwrap();
+        match history_guard.as_ref() {
+            Some(conn) => {
+                let today_local = now.with_timezone(&chrono::Local).date_naive().to_string();
+                for section in &sections {
+                    history::upsert_day(
+                        conn,
+                        &today_local,
+                        section.summary.agent,
+                        section.summary.today.tokens,
+                        section.summary.today.cost,
+                        section.summary.by_project.len(),
+                        section.summary.by_model.len(),
+                    );
+                }
+                sections
+                    .iter()
+                    .map(|s| (s.summary.agent, history::read_last_n_days(conn, s.summary.agent, 30)))
+                    .collect()
+            }
+            None => std::collections::HashMap::new(),
+        }
+    };
+
+    let payload = dashboard::build_payload(&sections, &trends, now);
     *state.dashboard.lock().unwrap() = Some(payload.clone());
     let _ = app.emit("dashboard-updated", &payload);
 
@@ -171,6 +218,7 @@ fn main() {
             last_pricing_attempt: Mutex::new(None),
             unpriced_count: Mutex::new(0),
             dashboard: Mutex::new(None),
+            history: Mutex::new(history::open(&history_db_path())),
         })
         .on_window_event(|window, event| {
             // Closing the panel hides it (instant reopen, listeners intact);

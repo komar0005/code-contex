@@ -1,3 +1,4 @@
+use crate::history::TrendPoint;
 use crate::limits::LimitsSnapshot;
 use crate::menu_format::{format_reset_in, format_tokens, format_usd};
 use crate::model::Agent;
@@ -5,6 +6,7 @@ use crate::summary::AgentSection;
 use crate::windows::TokenCost;
 use chrono::{DateTime, Local, TimeZone, Utc};
 use serde::Serialize;
+use std::collections::HashMap;
 
 /// The JSON contract with `ui/panel.html`. Numbers arrive pre-formatted
 /// (Rust owns formatting; the JS only paints). Raw exceptions: bar widths
@@ -28,6 +30,10 @@ pub struct AgentDashboard {
     pub today: StatTile,
     pub month: StatTile,
     pub week: StatTile,
+    /// Pre-rendered 30-day sparkline (inline SVG markup) from the app's own
+    /// history store; empty string when there's fewer than 2 days of
+    /// history to draw a line through.
+    pub trend_svg: String,
     pub by_project: Vec<BreakdownRow>,
     pub by_model: Vec<BreakdownRow>,
 }
@@ -59,14 +65,22 @@ pub struct BreakdownRow {
     pub cost: String,
 }
 
-pub fn build_payload(sections: &[AgentSection], now: DateTime<Utc>) -> DashboardPayload {
+pub fn build_payload(
+    sections: &[AgentSection],
+    trends: &HashMap<Agent, Vec<TrendPoint>>,
+    now: DateTime<Utc>,
+) -> DashboardPayload {
     DashboardPayload {
         refreshed_at: clock_in(now, &Local),
-        agents: sections.iter().map(|s| build_agent(s, now)).collect(),
+        agents: sections.iter().map(|s| build_agent(s, trends, now)).collect(),
     }
 }
 
-fn build_agent(section: &AgentSection, now: DateTime<Utc>) -> AgentDashboard {
+fn build_agent(
+    section: &AgentSection,
+    trends: &HashMap<Agent, Vec<TrendPoint>>,
+    now: DateTime<Utc>,
+) -> AgentDashboard {
     let summary = &section.summary;
     let (id, label) = match summary.agent {
         Agent::ClaudeCode => ("claude_code", "Claude Code"),
@@ -91,6 +105,7 @@ fn build_agent(section: &AgentSection, now: DateTime<Utc>) -> AgentDashboard {
         today: tile(&summary.today),
         month: tile(&summary.month),
         week: tile(&summary.last_7_days),
+        trend_svg: trends.get(&summary.agent).map(|p| render_trend_svg(p)).unwrap_or_default(),
         by_project: summary
             .by_project
             .iter()
@@ -140,6 +155,35 @@ fn tile(cost: &TokenCost) -> StatTile {
     StatTile { tokens: format_tokens(cost.tokens), cost: format_usd(cost.cost) }
 }
 
+/// Renders a 30-day token trend as inline SVG (viewBox 0..100 x 0..24), so
+/// the panel JS stays a dumb paint layer — same principle as every other
+/// pre-formatted field in this payload. `stroke="currentColor"` picks up the
+/// agent's accent color from CSS. Fewer than 2 points means there's no line
+/// to draw, so callers get an empty string (no card renders).
+fn render_trend_svg(points: &[TrendPoint]) -> String {
+    if points.len() < 2 {
+        return String::new();
+    }
+    let max_tokens = points.iter().map(|p| p.tokens).max().unwrap_or(0);
+    if max_tokens == 0 {
+        return String::new();
+    }
+    let step = 100.0 / (points.len() - 1) as f64;
+    let coords: Vec<String> = points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let x = i as f64 * step;
+            let y = 23.0 - (p.tokens as f64 / max_tokens as f64) * 22.0;
+            format!("{x:.1},{y:.1}")
+        })
+        .collect();
+    format!(
+        r#"<svg viewBox="0 0 100 24" preserveAspectRatio="none" class="sparkline"><polyline points="{}" fill="none" stroke="currentColor" stroke-width="2" vector-effect="non-scaling-stroke"/></svg>"#,
+        coords.join(" ")
+    )
+}
+
 fn clock_in<Tz: TimeZone>(t: DateTime<Utc>, tz: &Tz) -> String
 where
     Tz::Offset: std::fmt::Display,
@@ -159,6 +203,10 @@ mod tests {
 
     fn now() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap()
+    }
+
+    fn no_trends() -> HashMap<Agent, Vec<TrendPoint>> {
+        HashMap::new()
     }
 
     fn section(agent: Agent, limits: Option<LimitsSnapshot>) -> AgentSection {
@@ -186,7 +234,8 @@ mod tests {
             )),
             seven_day: Some(RateWindow::new(34.0, None)),
         };
-        let payload = build_payload(&[section(Agent::ClaudeCode, Some(limits))], now());
+        let payload =
+            build_payload(&[section(Agent::ClaudeCode, Some(limits))], &no_trends(), now());
         assert_eq!(payload.agents.len(), 1);
         let agent = &payload.agents[0];
         assert_eq!(agent.id, "claude_code");
@@ -209,7 +258,7 @@ mod tests {
 
     #[test]
     fn no_limits_yields_estimated_block_from_active_5h_block() {
-        let payload = build_payload(&[section(Agent::ClaudeCode, None)], now());
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &no_trends(), now());
         let agent = &payload.agents[0];
         assert!(agent.limits.is_none());
         // The fixture event is at `now`, so a 5h block is active.
@@ -219,7 +268,7 @@ mod tests {
 
     #[test]
     fn opencode_has_no_limits_and_no_estimated_block() {
-        let payload = build_payload(&[section(Agent::OpenCode, None)], now());
+        let payload = build_payload(&[section(Agent::OpenCode, None)], &no_trends(), now());
         let agent = &payload.agents[0];
         assert_eq!(agent.id, "opencode");
         assert_eq!(agent.label, "opencode");
@@ -229,7 +278,7 @@ mod tests {
 
     #[test]
     fn empty_sections_yield_empty_agents() {
-        let payload = build_payload(&[], now());
+        let payload = build_payload(&[], &no_trends(), now());
         assert!(payload.agents.is_empty());
     }
 
@@ -239,7 +288,8 @@ mod tests {
             five_hour: Some(RateWindow::new(62.0, None)),
             seven_day: None,
         };
-        let payload = build_payload(&[section(Agent::ClaudeCode, Some(limits))], now());
+        let payload =
+            build_payload(&[section(Agent::ClaudeCode, Some(limits))], &no_trends(), now());
         let json = serde_json::to_value(&payload).unwrap();
         assert!(json["refreshed_at"].is_string());
         let agent = &json["agents"][0];
@@ -249,8 +299,42 @@ mod tests {
         assert!(agent.get("estimated_block").is_none()); // absent when None
         assert!(agent["today"]["tokens"].is_string());
         assert!(agent["today"]["cost"].is_string());
+        assert!(agent["trend_svg"].is_string());
         assert!(agent["by_project"][0]["name"].is_string());
         assert!(agent["by_model"][0]["tokens"].is_string());
+    }
+
+    #[test]
+    fn no_trend_history_yields_empty_svg() {
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &no_trends(), now());
+        assert_eq!(payload.agents[0].trend_svg, "");
+    }
+
+    #[test]
+    fn single_trend_point_yields_empty_svg() {
+        let mut trends = HashMap::new();
+        trends.insert(
+            Agent::ClaudeCode,
+            vec![TrendPoint { date: "2026-07-15".into(), tokens: 100, cost: 1.0 }],
+        );
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &trends, now());
+        assert_eq!(payload.agents[0].trend_svg, "");
+    }
+
+    #[test]
+    fn two_or_more_trend_points_render_a_polyline() {
+        let mut trends = HashMap::new();
+        trends.insert(
+            Agent::ClaudeCode,
+            vec![
+                TrendPoint { date: "2026-07-14".into(), tokens: 100, cost: 1.0 },
+                TrendPoint { date: "2026-07-15".into(), tokens: 400, cost: 4.0 },
+            ],
+        );
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &trends, now());
+        let svg = &payload.agents[0].trend_svg;
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains("<polyline"));
     }
 
     #[test]
