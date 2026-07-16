@@ -13,6 +13,7 @@ mod preferences;
 mod price_fetch;
 mod pricing;
 mod provider;
+mod records;
 mod statusline;
 mod summary;
 mod tray;
@@ -159,14 +160,16 @@ pub fn refresh_all(app: &AppHandle) {
         summary::total_unpriced_this_month(sections.iter().map(|s| &s.summary));
     *state.unpriced_count.lock().unwrap() = unpriced_count;
 
-    let (trends, session_stats): (
+    let (trends, session_stats, records_by_agent): (
         std::collections::HashMap<Agent, Vec<history::TrendPoint>>,
         std::collections::HashMap<Agent, history::SessionStats>,
+        std::collections::HashMap<Agent, records::PersonalRecords>,
     ) = {
         let history_guard = state.history.lock().unwrap();
         match history_guard.as_ref() {
             Some(conn) => {
-                let today_local = now.with_timezone(&chrono::Local).date_naive().to_string();
+                let today_local_naive = now.with_timezone(&chrono::Local).date_naive();
+                let today_local = today_local_naive.to_string();
                 for section in &sections {
                     history::upsert_day(
                         conn,
@@ -193,13 +196,25 @@ pub fn refresh_all(app: &AppHandle) {
                         (s.summary.agent, history::today_session_stats(conn, s.summary.agent, &today_local))
                     })
                     .collect();
-                (trends, session_stats)
+                // Streaks/best-day (phase 3) — derived on the fly from the
+                // same rows just upserted above, no extra table.
+                let records_by_agent = sections
+                    .iter()
+                    .map(|s| {
+                        (s.summary.agent, records::personal_records(conn, s.summary.agent, today_local_naive))
+                    })
+                    .collect();
+                (trends, session_stats, records_by_agent)
             }
-            None => (std::collections::HashMap::new(), std::collections::HashMap::new()),
+            None => (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ),
         }
     };
 
-    let payload = dashboard::build_payload(&sections, &trends, &session_stats, now);
+    let payload = dashboard::build_payload(&sections, &trends, &session_stats, &records_by_agent, now);
     *state.dashboard.lock().unwrap() = Some(payload.clone());
     let _ = app.emit("dashboard-updated", &payload);
 

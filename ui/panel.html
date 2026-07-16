@@ -299,6 +299,20 @@
       </div>`;
     }
 
+    function recordsCard(records) {
+      if (!records) return "";
+      const day = (n) => `${n} día${n === 1 ? "" : "s"}`;
+      let rows = `<div class="status-line"><span>🔥 Racha actual</span><b>${day(records.current_streak_days)}</b></div>`;
+      rows += `<div class="status-line"><span>🏆 Racha más larga</span><b>${day(records.longest_streak_days)}</b></div>`;
+      if (records.best_day) {
+        rows += `<div class="status-line"><span>📈 Mejor día</span><b>${records.best_day}</b></div>`;
+      }
+      if (records.best_lines_day) {
+        rows += `<div class="status-line"><span>✍️ Mejor día (líneas)</span><b>${records.best_lines_day}</b></div>`;
+      }
+      return `<div class="card"><h4>Récords personales</h4>${rows}</div>`;
+    }
+
     function breakdownCard(title, rows) {
       if (!rows.length) return "";
       const body = rows
@@ -350,6 +364,7 @@
           <div class="lines-row"><span class="added">+${agent.lines_today.added}</span><span class="removed">-${agent.lines_today.removed}</span>${sessions}</div>
         </div>`;
       }
+      html += recordsCard(agent.records);
       html += breakdownCard("Por proyecto", agent.by_project);
       html += breakdownCard("Por modelo", agent.by_model);
       content.innerHTML = html;

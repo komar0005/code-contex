@@ -23,6 +23,10 @@ No accounts, no telemetry, no server of its own.
   (where the platform supports it).
 - **30-day trend sparklines** per agent, backed by the app's own local
   history — no network, no account, just daily rollups next to your stats.
+- **Personal records** — current/longest daily streak and best day (by
+  tokens, and by lines added if you've installed the statusLine hook)
+  computed from your own history. Local-only: it's you against your own
+  best days, never a leaderboard against anyone else.
 - **Terminal statusLine integration** — from the panel's Ajustes screen you
   can install a `statusLine.command` into `~/.claude/settings.json` so your
   5h/7d usage and today's cost show up right in Claude Code's terminal, plus
