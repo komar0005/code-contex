@@ -1,4 +1,4 @@
-# AI Usage Tray
+# CodeContextAI
 
 A tray / menu-bar widget that keeps your AI coding-agent usage visible at all
 times: **real Anthropic rate limits** (the same 5h / 7-day meters you see on
