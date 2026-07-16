@@ -1,4 +1,4 @@
-use crate::history::TrendPoint;
+use crate::history::{SessionStats, TrendPoint};
 use crate::limits::LimitsSnapshot;
 use crate::menu_format::{format_reset_in, format_tokens, format_usd};
 use crate::model::Agent;
@@ -34,8 +34,22 @@ pub struct AgentDashboard {
     /// history store; empty string when there's fewer than 2 days of
     /// history to draw a line through.
     pub trend_svg: String,
+    /// Lines added/removed today, from the statusLine hook (phase 2). Only
+    /// ever `Some` for Claude Code, and only once the user has installed
+    /// that hook and it's sent at least one session — absent otherwise
+    /// (never a false "0" for someone who never installed it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines_today: Option<LinesDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sessions_today: Option<u32>,
     pub by_project: Vec<BreakdownRow>,
     pub by_model: Vec<BreakdownRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LinesDelta {
+    pub added: u64,
+    pub removed: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,17 +82,19 @@ pub struct BreakdownRow {
 pub fn build_payload(
     sections: &[AgentSection],
     trends: &HashMap<Agent, Vec<TrendPoint>>,
+    session_stats: &HashMap<Agent, SessionStats>,
     now: DateTime<Utc>,
 ) -> DashboardPayload {
     DashboardPayload {
         refreshed_at: clock_in(now, &Local),
-        agents: sections.iter().map(|s| build_agent(s, trends, now)).collect(),
+        agents: sections.iter().map(|s| build_agent(s, trends, session_stats, now)).collect(),
     }
 }
 
 fn build_agent(
     section: &AgentSection,
     trends: &HashMap<Agent, Vec<TrendPoint>>,
+    session_stats: &HashMap<Agent, SessionStats>,
     now: DateTime<Utc>,
 ) -> AgentDashboard {
     let summary = &section.summary;
@@ -97,6 +113,7 @@ fn build_agent(
     } else {
         None
     };
+    let stats = session_stats.get(&summary.agent);
     AgentDashboard {
         id,
         label,
@@ -106,6 +123,8 @@ fn build_agent(
         month: tile(&summary.month),
         week: tile(&summary.last_7_days),
         trend_svg: trends.get(&summary.agent).map(|p| render_trend_svg(p)).unwrap_or_default(),
+        lines_today: stats.map(|s| LinesDelta { added: s.lines_added, removed: s.lines_removed }),
+        sessions_today: stats.map(|s| s.sessions),
         by_project: summary
             .by_project
             .iter()
@@ -209,6 +228,10 @@ mod tests {
         HashMap::new()
     }
 
+    fn no_sessions() -> HashMap<Agent, SessionStats> {
+        HashMap::new()
+    }
+
     fn section(agent: Agent, limits: Option<LimitsSnapshot>) -> AgentSection {
         let event = UsageEvent {
             agent,
@@ -235,7 +258,7 @@ mod tests {
             seven_day: Some(RateWindow::new(34.0, None)),
         };
         let payload =
-            build_payload(&[section(Agent::ClaudeCode, Some(limits))], &no_trends(), now());
+            build_payload(&[section(Agent::ClaudeCode, Some(limits))], &no_trends(), &no_sessions(), now());
         assert_eq!(payload.agents.len(), 1);
         let agent = &payload.agents[0];
         assert_eq!(agent.id, "claude_code");
@@ -258,7 +281,7 @@ mod tests {
 
     #[test]
     fn no_limits_yields_estimated_block_from_active_5h_block() {
-        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &no_trends(), now());
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &no_trends(), &no_sessions(), now());
         let agent = &payload.agents[0];
         assert!(agent.limits.is_none());
         // The fixture event is at `now`, so a 5h block is active.
@@ -268,7 +291,7 @@ mod tests {
 
     #[test]
     fn opencode_has_no_limits_and_no_estimated_block() {
-        let payload = build_payload(&[section(Agent::OpenCode, None)], &no_trends(), now());
+        let payload = build_payload(&[section(Agent::OpenCode, None)], &no_trends(), &no_sessions(), now());
         let agent = &payload.agents[0];
         assert_eq!(agent.id, "opencode");
         assert_eq!(agent.label, "opencode");
@@ -278,7 +301,7 @@ mod tests {
 
     #[test]
     fn empty_sections_yield_empty_agents() {
-        let payload = build_payload(&[], &no_trends(), now());
+        let payload = build_payload(&[], &no_trends(), &no_sessions(), now());
         assert!(payload.agents.is_empty());
     }
 
@@ -289,7 +312,7 @@ mod tests {
             seven_day: None,
         };
         let payload =
-            build_payload(&[section(Agent::ClaudeCode, Some(limits))], &no_trends(), now());
+            build_payload(&[section(Agent::ClaudeCode, Some(limits))], &no_trends(), &no_sessions(), now());
         let json = serde_json::to_value(&payload).unwrap();
         assert!(json["refreshed_at"].is_string());
         let agent = &json["agents"][0];
@@ -306,7 +329,7 @@ mod tests {
 
     #[test]
     fn no_trend_history_yields_empty_svg() {
-        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &no_trends(), now());
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &no_trends(), &no_sessions(), now());
         assert_eq!(payload.agents[0].trend_svg, "");
     }
 
@@ -317,7 +340,7 @@ mod tests {
             Agent::ClaudeCode,
             vec![TrendPoint { date: "2026-07-15".into(), tokens: 100, cost: 1.0 }],
         );
-        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &trends, now());
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &trends, &no_sessions(), now());
         assert_eq!(payload.agents[0].trend_svg, "");
     }
 
@@ -331,10 +354,31 @@ mod tests {
                 TrendPoint { date: "2026-07-15".into(), tokens: 400, cost: 4.0 },
             ],
         );
-        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &trends, now());
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &trends, &no_sessions(), now());
         let svg = &payload.agents[0].trend_svg;
         assert!(svg.starts_with("<svg"));
         assert!(svg.contains("<polyline"));
+    }
+
+    #[test]
+    fn no_session_data_yields_absent_lines_and_sessions() {
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &no_trends(), &no_sessions(), now());
+        assert!(payload.agents[0].lines_today.is_none());
+        assert!(payload.agents[0].sessions_today.is_none());
+        let json = serde_json::to_value(&payload).unwrap();
+        assert!(json["agents"][0].get("lines_today").is_none()); // absent, not null
+    }
+
+    #[test]
+    fn session_stats_populate_lines_and_sessions_today() {
+        let mut stats = HashMap::new();
+        stats.insert(Agent::ClaudeCode, SessionStats { sessions: 3, lines_added: 58, lines_removed: 12 });
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &no_trends(), &stats, now());
+        let agent = &payload.agents[0];
+        assert_eq!(agent.sessions_today, Some(3));
+        let lines = agent.lines_today.as_ref().unwrap();
+        assert_eq!(lines.added, 58);
+        assert_eq!(lines.removed, 12);
     }
 
     #[test]

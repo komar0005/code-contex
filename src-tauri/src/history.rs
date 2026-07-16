@@ -44,6 +44,11 @@ pub fn open(db_path: &Path) -> Option<Connection> {
 }
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    // Two potential writers (the long-lived tray app + frequent, short-lived
+    // `--statusline` invocations from phase 2) — the default rollback
+    // journal can return "database is locked" under contention. WAL allows
+    // one writer and concurrent readers without blocking.
+    conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS daily_usage (
             date TEXT NOT NULL,
@@ -57,8 +62,108 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            date TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            project TEXT,
+            model TEXT,
+            cost_usd REAL NOT NULL,
+            lines_added INTEGER NOT NULL,
+            lines_removed INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_agent_date ON sessions(agent, date);",
     )
+}
+
+/// One session's latest known totals, as fed by Claude Code's statusLine
+/// hook (`crate::statusline`). Claude Code sends session-cumulative totals
+/// on every invocation, not deltas, so `upsert_session` always overwrites
+/// with the newest values — same "keep the last occurrence" principle as
+/// `parsers/claude_code.rs` uses for JSONL message ids.
+pub struct SessionUpdate<'a> {
+    pub session_id: &'a str,
+    pub date: &'a str,
+    pub agent: Agent,
+    pub project: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub cost_usd: f64,
+    pub lines_added: u64,
+    pub lines_removed: u64,
+    pub duration_ms: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub fn upsert_session(conn: &Connection, update: &SessionUpdate) {
+    let _ = conn.execute(
+        "INSERT INTO sessions
+            (session_id, date, agent, project, model, cost_usd, lines_added, lines_removed, duration_ms, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         ON CONFLICT(session_id) DO UPDATE SET
+            date = excluded.date,
+            agent = excluded.agent,
+            project = excluded.project,
+            model = excluded.model,
+            cost_usd = excluded.cost_usd,
+            lines_added = excluded.lines_added,
+            lines_removed = excluded.lines_removed,
+            duration_ms = excluded.duration_ms,
+            updated_at = excluded.updated_at",
+        params![
+            update.session_id,
+            update.date,
+            agent_key(update.agent),
+            update.project,
+            update.model,
+            update.cost_usd,
+            update.lines_added as i64,
+            update.lines_removed as i64,
+            update.duration_ms as i64,
+            update.updated_at.to_rfc3339(),
+        ],
+    );
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SessionStats {
+    pub sessions: u32,
+    pub lines_added: u64,
+    pub lines_removed: u64,
+}
+
+/// Aggregates `sessions` rows for `agent` on local calendar day `date`.
+/// Missing/corrupt table returns zeros, same tolerance as the rest of this
+/// module — callers that need to distinguish "zero today" from "feature
+/// never used" should check `has_any_sessions` first.
+pub fn today_session_stats(conn: &Connection, agent: Agent, date: &str) -> SessionStats {
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(lines_added), 0), COALESCE(SUM(lines_removed), 0)
+         FROM sessions WHERE agent = ?1 AND date = ?2",
+        params![agent_key(agent), date],
+        |row| {
+            Ok(SessionStats {
+                sessions: row.get::<_, i64>(0)? as u32,
+                lines_added: row.get::<_, i64>(1)? as u64,
+                lines_removed: row.get::<_, i64>(2)? as u64,
+            })
+        },
+    )
+    .unwrap_or_default()
+}
+
+/// Whether `agent` has ever had a session recorded — gates whether the
+/// panel shows the lines-added/removed tile at all (vs. a user who simply
+/// never installed the statusLine hook).
+pub fn has_any_sessions(conn: &Connection, agent: Agent) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sessions WHERE agent = ?1 LIMIT 1",
+        params![agent_key(agent)],
+        |_| Ok(()),
+    )
+    .is_ok()
 }
 
 pub fn is_backfilled(conn: &Connection) -> bool {
@@ -242,5 +347,65 @@ mod tests {
         mark_backfilled(&conn, now);
         mark_backfilled(&conn, now);
         assert!(is_backfilled(&conn));
+    }
+
+    fn session_update<'a>(session_id: &'a str, lines_added: u64, updated_at: DateTime<Utc>) -> SessionUpdate<'a> {
+        SessionUpdate {
+            session_id,
+            date: "2026-07-16",
+            agent: Agent::ClaudeCode,
+            project: Some("proj-a"),
+            model: Some("claude-sonnet-5"),
+            cost_usd: 1.5,
+            lines_added,
+            lines_removed: 3,
+            duration_ms: 60_000,
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn has_any_sessions_false_until_first_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("history.db")).unwrap();
+        assert!(!has_any_sessions(&conn, Agent::ClaudeCode));
+        upsert_session(&conn, &session_update("s1", 10, Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap()));
+        assert!(has_any_sessions(&conn, Agent::ClaudeCode));
+        assert!(!has_any_sessions(&conn, Agent::OpenCode));
+    }
+
+    #[test]
+    fn upsert_session_same_id_twice_keeps_latest_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("history.db")).unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap();
+        upsert_session(&conn, &session_update("s1", 10, t0));
+        upsert_session(&conn, &session_update("s1", 58, t0 + chrono::Duration::minutes(5)));
+        let stats = today_session_stats(&conn, Agent::ClaudeCode, "2026-07-16");
+        assert_eq!(stats.sessions, 1); // same session_id, not a second row
+        assert_eq!(stats.lines_added, 58);
+    }
+
+    #[test]
+    fn today_session_stats_sums_across_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("history.db")).unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap();
+        upsert_session(&conn, &session_update("s1", 10, t0));
+        upsert_session(&conn, &session_update("s2", 20, t0));
+        let stats = today_session_stats(&conn, Agent::ClaudeCode, "2026-07-16");
+        assert_eq!(stats.sessions, 2);
+        assert_eq!(stats.lines_added, 30);
+        assert_eq!(stats.lines_removed, 6);
+    }
+
+    #[test]
+    fn today_session_stats_zero_for_other_day() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("history.db")).unwrap();
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 16, 12, 0, 0).unwrap();
+        upsert_session(&conn, &session_update("s1", 10, t0));
+        let stats = today_session_stats(&conn, Agent::ClaudeCode, "2026-07-15");
+        assert_eq!(stats, SessionStats::default());
     }
 }
