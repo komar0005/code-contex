@@ -1,0 +1,32 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="arc" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#2ec9a7"/>
+      <stop offset="55%" stop-color="#e8a23c"/>
+      <stop offset="100%" stop-color="#e8824a"/>
+    </linearGradient>
+    <linearGradient id="bgg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1b1e27"/>
+      <stop offset="100%" stop-color="#0e1015"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="30%" cy="25%" r="80%">
+      <stop offset="0%" stop-color="#e8824a" stop-opacity="0.18"/>
+      <stop offset="55%" stop-color="#e8824a" stop-opacity="0.0"/>
+    </radialGradient>
+  </defs>
+  <!-- rounded dark tile -->
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#bgg)"/>
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#glow)"/>
+  <!-- gauge track: 240° arc from 150° to 30° (r=300, cx=512, cy=540) -->
+  <path d="M 252.2 690 A 300 300 0 1 1 771.8 690"
+        fill="none" stroke="#2a2e3b" stroke-width="86" stroke-linecap="round"/>
+  <!-- gauge fill: ~62% of the 240° sweep -->
+  <path d="M 252.2 690 A 300 300 0 0 1 704.4 296.8"
+        fill="none" stroke="url(#arc)" stroke-width="86" stroke-linecap="round"/>
+  <!-- needle hub -->
+  <circle cx="512" cy="540" r="58" fill="#e8eaf0"/>
+  <!-- needle pointing to the fill's end (~58° above horizon right side) -->
+  <g transform="rotate(38 512 540)">
+    <rect x="496" y="330" width="32" height="230" rx="16" fill="#e8eaf0"/>
+  </g>
+</svg>

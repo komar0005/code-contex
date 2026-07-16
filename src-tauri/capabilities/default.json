@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Panel window IPC (invoke + events)",
+  "windows": ["panel"],
+  "permissions": [
+    "core:default"
+  ]
+}
