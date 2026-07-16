@@ -1,5 +1,10 @@
 name: build
 
+# tauri-action creates the GitHub release on v* tags; the default token
+# is read-only on new repos.
+permissions:
+  contents: write
+
 on:
   push:
     branches: [main]
