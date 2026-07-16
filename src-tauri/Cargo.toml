@@ -1,6 +1,6 @@
 [package]
 name = "ai-usage-tray"
-version = "0.1.0"
+version = "0.1.1"
 description = "Tray widget showing AI coding-agent usage and real rate limits"
 authors = ["komar0005"]
 edition = "2021"
