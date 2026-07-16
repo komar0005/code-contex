@@ -46,6 +46,26 @@ pub fn read_credentials(path: &Path) -> Option<ClaudeCredentials> {
     parse_credentials(&std::fs::read_to_string(path).ok()?)
 }
 
+/// On macOS, Claude Code stores its OAuth credentials in the login
+/// Keychain (item "Claude Code-credentials") instead of the plaintext
+/// file. The payload is the same JSON `parse_credentials` understands.
+#[cfg(target_os = "macos")]
+pub fn read_credentials_from_keychain() -> Option<ClaudeCredentials> {
+    let output = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_credentials(String::from_utf8(output.stdout).ok()?.trim())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn read_credentials_from_keychain() -> Option<ClaudeCredentials> {
+    None
+}
+
 pub fn parse_credentials(content: &str) -> Option<ClaudeCredentials> {
     let file: CredentialsFile = serde_json::from_str(content).ok()?;
     let section = file.claude_ai_oauth?;

@@ -187,6 +187,10 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
 
+            // Tray-only app: keep it out of the macOS Dock.
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
             hyprland_register_panel_float_rule();
 
             // First-run loading state so the tray never blocks or shows

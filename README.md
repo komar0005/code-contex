@@ -1,46 +1,91 @@
-# AI Usage Tray Widget
+# AI Usage Tray
 
-Tray/menu-bar app for macOS and Linux showing local token/cost consumption
-for Claude Code and opencode. Reads only files these tools already write to
-disk — no accounts, no telemetry, no server of its own.
+A tray / menu-bar widget that keeps your AI coding-agent usage visible at all
+times: **real Anthropic rate limits** (the same 5h / 7-day meters you see on
+claude.ai), token and cost totals, and per-project / per-model breakdowns —
+for **Claude Code** and **opencode**.
 
-## Build
+Everything is computed locally from files those tools already write to disk.
+No accounts, no telemetry, no server of its own.
 
-```bash
-cd src-tauri
-cargo tauri build
-```
+## Features
 
-Produces a platform-native bundle (`.app` on macOS, `.deb`/`.AppImage` on
-Linux, depending on your `cargo tauri build` target flags).
+- **Real rate-limit bars** — reads Claude Code's own OAuth credentials and
+  queries Anthropic's usage endpoint, so the 5h and 7-day percentages and
+  reset countdowns match your account exactly. When no credentials are
+  available it falls back to a local estimate, clearly labeled `(estimado)`.
+- **At-a-glance tray menu** — limit bars, today / month / 7-day tokens and
+  cost per agent, right in the native menu.
+- **Dashboard panel** ("Ver más…") — a dark glassmorphism window with
+  per-agent tabs, traffic-light limit bars with live countdowns, stat tiles,
+  and per-project / per-model tables, plus inline settings.
+- **Tray headline** — optional "5h 62% · 7d 34%" label next to the icon
+  (where the platform supports it).
+- **Cost pricing** via the LiteLLM price table, refreshed at most daily.
 
-## Linux prerequisite
+## Install
 
-The tray icon depends on `libappindicator`/`ayatana-appindicator` being
-installed on your system. On Debian/Ubuntu:
+Grab the installer for your platform from the
+[latest release](https://github.com/komar0005/code-contex/releases):
+
+| Platform | File |
+|---|---|
+| Windows | `*-setup.exe` (NSIS) or `*.msi` |
+| Linux (Debian/Ubuntu) | `*.deb` |
+| Linux (Fedora/openSUSE) | `*.rpm` |
+| Linux (any) | `*.AppImage` |
+| macOS | `*.dmg` (universal: Apple Silicon + Intel) |
+
+### Linux notes
+
+The tray icon requires an appindicator implementation. On Debian/Ubuntu:
 
 ```bash
 sudo apt install libayatana-appindicator3-1
 ```
 
-Other distros: install the equivalent package for your desktop environment.
-Without it, the app runs but no tray icon appears.
+The `.deb`/`.rpm` packages declare it as a dependency; for the AppImage,
+install it manually if no icon shows up.
+
+### macOS notes
+
+Releases are not code-signed (no Apple Developer certificate). If Gatekeeper
+refuses to open the app:
+
+```bash
+xattr -cr "/Applications/ai-usage-tray.app"
+```
+
+On macOS, Claude Code stores its OAuth credentials in the login Keychain;
+the app reads them from there automatically (item `Claude Code-credentials`).
+macOS may ask once for permission to access it.
 
 ## Data sources
 
-- Claude Code: `~/.claude/projects/**/*.jsonl`
-- opencode: `$OPENCODE_DATA_DIR/opencode.db` (defaults to
-  `~/.local/share/opencode/opencode.db`), opened read-only. One usage entry
-  per opencode session (session-level token totals), not per message.
+| Source | Location | Access |
+|---|---|---|
+| Claude Code usage | `~/.claude/projects/**/*.jsonl` | read-only |
+| Claude Code credentials | `~/.claude/.credentials.json`, or the macOS Keychain | read-only, never written |
+| Real limits | `GET https://api.anthropic.com/api/oauth/usage` | with the token above |
+| opencode usage | `$OPENCODE_DATA_DIR/opencode.db` (default `~/.local/share/opencode/opencode.db`) | read-only SQLite |
+| Model prices | LiteLLM's public price table | fetched at most daily |
 
-If neither source has usage data, the tray shows an empty-state message
-instead of the per-agent sections.
+The only network calls the app ever makes are the two listed above; both can
+be observed in the source (`claude_oauth.rs`, `price_fetch.rs`). Preferences
+are stored in your platform's config dir under `ai-usage-tray/preferences.json`.
 
-## Scope (v1)
+## Build from source
 
-- macOS and Linux only.
-- No persistent history beyond what Claude Code/opencode retain on disk —
-  every refresh recomputes from source files.
-- Budget bars (5h block / 7-day window) are against a **personal budget you
-  configure in Preferences**, not Anthropic's real account limit — that
-  value isn't available locally.
+Prerequisites: [Rust](https://rustup.rs) and the
+[Tauri 2 system dependencies](https://tauri.app/start/prerequisites/).
+
+```bash
+cd src-tauri
+cargo tauri dev      # run in development
+cargo tauri build    # produce the platform installer
+cargo test           # run the test suite
+```
+
+## License
+
+[MIT](LICENSE)

@@ -1,8 +1,8 @@
 [package]
 name = "ai-usage-tray"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Tray widget showing AI coding-agent usage and real rate limits"
+authors = ["komar0005"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

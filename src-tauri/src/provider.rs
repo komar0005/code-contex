@@ -68,7 +68,15 @@ impl Provider for ClaudeProvider {
     }
 
     fn fetch_limits(&mut self, now: DateTime<Utc>) -> Option<LimitsSnapshot> {
-        let creds = claude_oauth::read_credentials(&self.credentials_path)?;
+        // The keychain fallback only applies to the real credentials path:
+        // tests point at temp paths and must stay hermetic.
+        let creds = claude_oauth::read_credentials(&self.credentials_path).or_else(|| {
+            if self.credentials_path == claude_oauth::default_credentials_path() {
+                claude_oauth::read_credentials_from_keychain()
+            } else {
+                None
+            }
+        })?;
         if creds.is_expired(now) {
             return None;
         }
