@@ -107,6 +107,26 @@ fn persist_session(db_path: &Path, input: &StatuslineInput) {
     history::upsert_session(&conn, &update);
 }
 
+/// `git branch --show-current` en el directorio de la sesión. Salida
+/// vacía (HEAD detached) y cualquier fallo (sin git, sin repo, sin dir)
+/// significan lo mismo: no hay rama que mostrar.
+fn git_branch(dir: Option<&str>) -> Option<String> {
+    let dir = dir?;
+    let output = std::process::Command::new("git")
+        .args(["-C", dir, "branch", "--show-current"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() {
+        None
+    } else {
+        Some(branch)
+    }
+}
+
 /// Called by the tray app (`refresh_all`) every refresh cycle — never from
 /// `--statusline` mode itself.
 pub fn write_snapshot(
@@ -177,6 +197,25 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn git_branch_none_outside_a_repo_or_without_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(git_branch(Some(dir.path().to_str().unwrap())), None);
+        assert_eq!(git_branch(None), None);
+    }
+
+    #[test]
+    fn git_branch_reads_current_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-b", "feature-x", path])
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        assert_eq!(git_branch(Some(path)), Some("feature-x".to_string()));
     }
 
     #[test]
