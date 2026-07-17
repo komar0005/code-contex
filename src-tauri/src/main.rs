@@ -5,6 +5,7 @@ mod claude_oauth;
 mod claude_settings;
 mod dashboard;
 mod history;
+mod limit_alerts;
 mod limits;
 mod menu_format;
 mod model;
@@ -30,6 +31,7 @@ use std::sync::Mutex;
 use summary::AgentSection;
 use tauri::tray::TrayIcon;
 use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_notification::NotificationExt;
 
 pub struct AppState {
     pub providers: Mutex<Vec<Box<dyn Provider>>>,
@@ -56,6 +58,10 @@ pub struct AppState {
     /// trends are then simply absent, same as any other degrade-in-silence
     /// failure in this app.
     pub history: Mutex<Option<rusqlite::Connection>>,
+    /// Per-(agent, window) record of the highest limit-alert level already
+    /// notified, so the periodic refresh doesn't re-send the same desktop
+    /// notification every cycle.
+    pub limit_alerts: Mutex<limit_alerts::LimitAlerts>,
 }
 
 fn claude_projects_dir() -> std::path::PathBuf {
@@ -160,6 +166,28 @@ pub fn refresh_all(app: &AppHandle) {
     let unpriced_count =
         summary::total_unpriced_this_month(sections.iter().map(|s| &s.summary));
     *state.unpriced_count.lock().unwrap() = unpriced_count;
+
+    let alerts: Vec<limit_alerts::Alert> = {
+        let mut tracker = state.limit_alerts.lock().unwrap();
+        sections
+            .iter()
+            .flat_map(|s| tracker.check(s.summary.agent, s.limits.as_ref(), now))
+            .collect()
+    };
+    for alert in alerts {
+        // Notification failures (no daemon, DND) are cosmetic — the tray
+        // itself still shows the percentages.
+        let result = app
+            .notification()
+            .builder()
+            .title(&alert.title)
+            .body(&alert.body)
+            .icon(alert.level.icon())
+            .show();
+        if let Err(e) = result {
+            eprintln!("limit alert notification failed: {e}");
+        }
+    }
 
     let (trends, session_stats, records_by_agent): (
         std::collections::HashMap<Agent, Vec<history::TrendPoint>>,
@@ -276,7 +304,9 @@ fn main() {
             unpriced_count: Mutex::new(0),
             dashboard: Mutex::new(None),
             history: Mutex::new(history::open(&history_db_path())),
+            limit_alerts: Mutex::new(limit_alerts::LimitAlerts::default()),
         })
+        .plugin(tauri_plugin_notification::init())
         .on_window_event(|window, event| {
             // Closing the panel hides it (instant reopen, listeners intact);
             // the app lives in the tray, so no window should ever exit it.
