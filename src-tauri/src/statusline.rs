@@ -10,6 +10,7 @@
 
 use crate::history::{self, SessionUpdate};
 use crate::model::Agent;
+use crate::statusline_format::StatuslineRender;
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -81,7 +82,13 @@ pub fn run(history_db_path: &Path, snapshot_path: &Path) {
 
     persist_session(history_db_path, &input);
 
-    println!("{}", build_line(&input, read_snapshot(snapshot_path)));
+    let dir = input
+        .workspace
+        .as_ref()
+        .and_then(|w| w.current_dir.as_deref())
+        .or(input.cwd.as_deref());
+    let branch = git_branch(dir);
+    println!("{}", build_output(&input, branch.as_deref(), read_snapshot(snapshot_path).as_ref()));
 }
 
 fn persist_session(db_path: &Path, input: &StatuslineInput) {
@@ -159,20 +166,29 @@ fn read_snapshot(path: &Path) -> Option<Snapshot> {
     Some(snapshot)
 }
 
-fn build_line(input: &StatuslineInput, snapshot: Option<Snapshot>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(snapshot) = &snapshot {
-        if let Some(title) = &snapshot.tray_title {
-            parts.push(title.clone());
-        }
-        if let Some(cost) = &snapshot.today_cost {
-            parts.push(format!("hoy {cost}"));
-        }
-    }
-    if let Some(model) = input.model.as_ref().and_then(|m| m.display_name.as_deref()) {
-        parts.push(model.to_string());
-    }
-    parts.join(" · ")
+/// Extrae de stdin+snapshot los datos ya listos para pintar y delega en
+/// statusline_format::render. El tray_title del snapshot viaja siempre
+/// como fallback; render lo ignora si el stdin trajo límites reales.
+fn build_output(
+    input: &StatuslineInput,
+    branch: Option<&str>,
+    snapshot: Option<&Snapshot>,
+) -> String {
+    let limits = input.rate_limits.as_ref();
+    let render = StatuslineRender {
+        branch,
+        model: input.model.as_ref().and_then(|m| m.display_name.as_deref()),
+        context_pct: input.context_window.as_ref().and_then(|c| c.used_percentage),
+        five_hour_pct: limits
+            .and_then(|l| l.five_hour.as_ref())
+            .and_then(|w| w.used_percentage),
+        seven_day_pct: limits
+            .and_then(|l| l.seven_day.as_ref())
+            .and_then(|w| w.used_percentage),
+        fallback_limits_text: snapshot.and_then(|s| s.tray_title.as_deref()),
+        today_cost: snapshot.and_then(|s| s.today_cost.as_deref()),
+    };
+    crate::statusline_format::render(&render)
 }
 
 #[cfg(test)]
@@ -219,27 +235,50 @@ mod tests {
     }
 
     #[test]
-    fn build_line_combines_snapshot_and_model() {
+    fn build_output_prefers_stdin_limits_over_snapshot_title() {
+        let mut input = input_with_model("Sonnet 5");
+        input.context_window = Some(ContextWindowInfo { used_percentage: Some(41.0) });
+        input.rate_limits = Some(RateLimitsInfo {
+            five_hour: Some(RateLimitWindow { used_percentage: Some(62.0) }),
+            seven_day: Some(RateLimitWindow { used_percentage: Some(34.0) }),
+        });
+        let snapshot = Snapshot {
+            written_at: now(),
+            tray_title: Some("5h 99% · 7d 99%".into()),
+            today_cost: Some("$4.30".into()),
+            refresh_interval_secs: 60,
+        };
+        let out = build_output(&input, Some("main"), Some(&snapshot));
+        assert_eq!(
+            crate::statusline_format::strip_ansi(&out),
+            "🌿 main · Sonnet 5 · ctx ▰▰▰▰▱▱▱▱▱▱ 41%\n5h ▰▰▰▰▰▰▱▱▱▱ 62% · 7d ▰▰▰▱▱▱▱▱▱▱ 34% · hoy $4.30"
+        );
+    }
+
+    #[test]
+    fn build_output_falls_back_to_snapshot_title_without_stdin_limits() {
         let snapshot = Snapshot {
             written_at: now(),
             tray_title: Some("5h 62% · 7d 34%".into()),
             today_cost: Some("$4.30".into()),
             refresh_interval_secs: 60,
         };
-        let line = build_line(&input_with_model("claude-sonnet-5"), Some(snapshot));
-        assert_eq!(line, "5h 62% · 7d 34% · hoy $4.30 · claude-sonnet-5");
+        let out = build_output(&input_with_model("Sonnet 5"), None, Some(&snapshot));
+        assert_eq!(
+            crate::statusline_format::strip_ansi(&out),
+            "Sonnet 5\n5h 62% · 7d 34% · hoy $4.30"
+        );
     }
 
     #[test]
-    fn build_line_falls_back_to_model_only_without_snapshot() {
-        let line = build_line(&input_with_model("claude-sonnet-5"), None);
-        assert_eq!(line, "claude-sonnet-5");
+    fn build_output_model_only_without_snapshot() {
+        let out = build_output(&input_with_model("Sonnet 5"), None, None);
+        assert_eq!(crate::statusline_format::strip_ansi(&out), "Sonnet 5");
     }
 
     #[test]
-    fn build_line_empty_when_nothing_is_known() {
-        let line = build_line(&StatuslineInput::default(), None);
-        assert_eq!(line, "");
+    fn build_output_empty_when_nothing_is_known() {
+        assert_eq!(build_output(&StatuslineInput::default(), None, None), "");
     }
 
     #[test]
