@@ -15,6 +15,7 @@ mod pricing;
 mod provider;
 mod records;
 mod statusline;
+mod statusline_format;
 mod summary;
 mod tray;
 mod windows;
