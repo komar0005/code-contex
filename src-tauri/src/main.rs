@@ -2,7 +2,9 @@
 
 mod cache;
 mod claude_oauth;
+mod claude_settings;
 mod dashboard;
+mod history;
 mod limits;
 mod menu_format;
 mod model;
@@ -11,6 +13,8 @@ mod preferences;
 mod price_fetch;
 mod pricing;
 mod provider;
+mod records;
+mod statusline;
 mod summary;
 mod tray;
 mod windows;
@@ -46,6 +50,11 @@ pub struct AppState {
     /// Last dashboard payload, served to the panel when it (re)opens.
     /// `None` until the first scan finishes.
     pub dashboard: Mutex<Option<DashboardPayload>>,
+    /// App-owned daily history (tokens/cost per day per agent), used for
+    /// trend sparklines. `None` when `history.db` couldn't be opened —
+    /// trends are then simply absent, same as any other degrade-in-silence
+    /// failure in this app.
+    pub history: Mutex<Option<rusqlite::Connection>>,
 }
 
 fn claude_projects_dir() -> std::path::PathBuf {
@@ -73,6 +82,14 @@ fn opencode_db_path() -> std::path::PathBuf {
 
 fn config_dir() -> std::path::PathBuf {
     dirs::config_dir().expect("config dir must resolve").join("ai-usage-tray")
+}
+
+fn history_db_path() -> std::path::PathBuf {
+    config_dir().join("history.db")
+}
+
+fn statusline_snapshot_path() -> std::path::PathBuf {
+    config_dir().join("statusline_snapshot.json")
 }
 
 /// Pricing changes rarely; refresh at most daily, retrying hourly after a
@@ -119,6 +136,18 @@ pub fn refresh_all(app: &AppHandle) {
     }
     let pricing = state.pricing.lock().unwrap().clone();
 
+    {
+        let history_guard = state.history.lock().unwrap();
+        if let Some(conn) = history_guard.as_ref() {
+            if !history::is_backfilled(conn) {
+                for (agent, events, _) in &gathered {
+                    history::backfill(conn, events, *agent, &pricing);
+                }
+                history::mark_backfilled(conn, now);
+            }
+        }
+    }
+
     let sections: Vec<AgentSection> = gathered
         .into_iter()
         .filter_map(|(agent, events, limits)| {
@@ -131,22 +160,88 @@ pub fn refresh_all(app: &AppHandle) {
         summary::total_unpriced_this_month(sections.iter().map(|s| &s.summary));
     *state.unpriced_count.lock().unwrap() = unpriced_count;
 
-    let payload = dashboard::build_payload(&sections, now);
+    let (trends, session_stats, records_by_agent): (
+        std::collections::HashMap<Agent, Vec<history::TrendPoint>>,
+        std::collections::HashMap<Agent, history::SessionStats>,
+        std::collections::HashMap<Agent, records::PersonalRecords>,
+    ) = {
+        let history_guard = state.history.lock().unwrap();
+        match history_guard.as_ref() {
+            Some(conn) => {
+                let today_local_naive = now.with_timezone(&chrono::Local).date_naive();
+                let today_local = today_local_naive.to_string();
+                for section in &sections {
+                    history::upsert_day(
+                        conn,
+                        &today_local,
+                        section.summary.agent,
+                        section.summary.today.tokens,
+                        section.summary.today.cost,
+                        section.summary.by_project.len(),
+                        section.summary.by_model.len(),
+                    );
+                }
+                let trends = sections
+                    .iter()
+                    .map(|s| (s.summary.agent, history::read_last_n_days(conn, s.summary.agent, 30)))
+                    .collect();
+                // Only present for an agent that has ever sent statusLine
+                // data (phase 2) — absence, not a false zero, is how the
+                // panel tells "never installed the hook" apart from
+                // "installed but nothing happened today".
+                let session_stats = sections
+                    .iter()
+                    .filter(|s| history::has_any_sessions(conn, s.summary.agent))
+                    .map(|s| {
+                        (s.summary.agent, history::today_session_stats(conn, s.summary.agent, &today_local))
+                    })
+                    .collect();
+                // Streaks/best-day (phase 3) — derived on the fly from the
+                // same rows just upserted above, no extra table.
+                let records_by_agent = sections
+                    .iter()
+                    .map(|s| {
+                        (s.summary.agent, records::personal_records(conn, s.summary.agent, today_local_naive))
+                    })
+                    .collect();
+                (trends, session_stats, records_by_agent)
+            }
+            None => (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            ),
+        }
+    };
+
+    let payload = dashboard::build_payload(&sections, &trends, &session_stats, &records_by_agent, now);
     *state.dashboard.lock().unwrap() = Some(payload.clone());
     let _ = app.emit("dashboard-updated", &payload);
+
+    let title = if prefs.show_tray_metric {
+        sections
+            .iter()
+            .find_map(|s| menu_format::format_tray_title(s.limits.as_ref()))
+    } else {
+        None
+    };
+    let claude_today_cost = sections
+        .iter()
+        .find(|s| s.summary.agent == Agent::ClaudeCode)
+        .map(|s| menu_format::format_usd(s.summary.today.cost));
+    statusline::write_snapshot(
+        &statusline_snapshot_path(),
+        title.as_deref(),
+        claude_today_cost.as_deref(),
+        prefs.refresh_interval_secs,
+        now,
+    );
 
     let tray_guard = state.tray.lock().unwrap();
     if let Some(tray_icon) = tray_guard.as_ref() {
         if let Ok(menu) = tray::build_menu(app, &sections, now) {
             let _ = tray_icon.set_menu(Some(menu));
         }
-        let title = if prefs.show_tray_metric {
-            sections
-                .iter()
-                .find_map(|s| menu_format::format_tray_title(s.limits.as_ref()))
-        } else {
-            None
-        };
         // Not every Linux DE renders appindicator labels/tooltips;
         // failures are cosmetic, so ignore them.
         let _ = tray_icon.set_title(title.as_deref());
@@ -155,6 +250,14 @@ pub fn refresh_all(app: &AppHandle) {
 }
 
 fn main() {
+    // Claude Code invokes this many times per session (debounced per
+    // turn); it must never pay the cost of starting Tauri/GTK, so this is
+    // checked and handled before the builder is ever touched.
+    if std::env::args().any(|arg| arg == "--statusline") {
+        statusline::run(&history_db_path(), &statusline_snapshot_path());
+        return;
+    }
+
     tauri::Builder::default()
         .manage(AppState {
             providers: Mutex::new(vec![
@@ -171,6 +274,7 @@ fn main() {
             last_pricing_attempt: Mutex::new(None),
             unpriced_count: Mutex::new(0),
             dashboard: Mutex::new(None),
+            history: Mutex::new(history::open(&history_db_path())),
         })
         .on_window_event(|window, event| {
             // Closing the panel hides it (instant reopen, listeners intact);
@@ -275,7 +379,10 @@ fn main() {
             save_preferences_cmd,
             get_pricing_status_cmd,
             get_dashboard_cmd,
-            refresh_cmd
+            refresh_cmd,
+            check_statusline_cmd,
+            install_statusline_cmd,
+            uninstall_statusline_cmd
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -353,6 +460,49 @@ fn get_dashboard_cmd(app: AppHandle) -> Option<DashboardPayload> {
 fn refresh_cmd(app: AppHandle) {
     let h = app.clone();
     tauri::async_runtime::spawn_blocking(move || refresh_all(&h));
+}
+
+/// Read-only: never writes `~/.claude/settings.json`. Lets the panel show
+/// what's there (nothing / ours / something else) before ever asking the
+/// user to confirm an install.
+#[tauri::command]
+fn check_statusline_cmd() -> Result<claude_settings::StatuslineState, String> {
+    let command = claude_settings::our_statusline_command()?;
+    claude_settings::check_statusline(&claude_settings::default_settings_path(), &command)
+}
+
+/// Only ever called after the panel's own confirmation dialog — this
+/// command assumes the user already said yes.
+#[tauri::command]
+fn install_statusline_cmd(app: AppHandle) -> Result<(), String> {
+    let command = claude_settings::our_statusline_command()?;
+    claude_settings::install_statusline(&claude_settings::default_settings_path(), &command)?;
+    let state = app.state::<AppState>();
+    let mut prefs = state.preferences.lock().unwrap().clone();
+    prefs.statusline_installed = true;
+    prefs.statusline_installed_command = Some(command);
+    preferences::save(&config_dir(), &prefs).map_err(|e| e.to_string())?;
+    *state.preferences.lock().unwrap() = prefs;
+    Ok(())
+}
+
+#[tauri::command]
+fn uninstall_statusline_cmd(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let expected = state
+        .preferences
+        .lock()
+        .unwrap()
+        .statusline_installed_command
+        .clone()
+        .ok_or_else(|| "esta app no tiene una statusLine instalada".to_string())?;
+    claude_settings::uninstall_statusline(&claude_settings::default_settings_path(), &expected)?;
+    let mut prefs = state.preferences.lock().unwrap().clone();
+    prefs.statusline_installed = false;
+    prefs.statusline_installed_command = None;
+    preferences::save(&config_dir(), &prefs).map_err(|e| e.to_string())?;
+    *state.preferences.lock().unwrap() = prefs;
+    Ok(())
 }
 
 /// On Hyprland, float the dashboard window (utility-window feel) instead

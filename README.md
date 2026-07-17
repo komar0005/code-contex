@@ -21,6 +21,19 @@ No accounts, no telemetry, no server of its own.
   and per-project / per-model tables, plus inline settings.
 - **Tray headline** — optional "5h 62% · 7d 34%" label next to the icon
   (where the platform supports it).
+- **30-day trend sparklines** per agent, backed by the app's own local
+  history — no network, no account, just daily rollups next to your stats.
+- **Personal records** — current/longest daily streak and best day (by
+  tokens, and by lines added if you've installed the statusLine hook)
+  computed from your own history. Local-only: it's you against your own
+  best days, never a leaderboard against anyone else.
+- **Terminal statusLine integration** — from the panel's Ajustes screen you
+  can install a `statusLine.command` into `~/.claude/settings.json` so your
+  5h/7d usage and today's cost show up right in Claude Code's terminal, plus
+  it captures lines-added/removed and session counts the JSONL logs don't
+  carry. Opt-in only: the app asks before touching that file, only ever
+  edits the `statusLine` key, and never overwrites a command you already
+  had configured without asking first.
 - **Cost pricing** via the LiteLLM price table, refreshed at most daily.
 
 ## Install

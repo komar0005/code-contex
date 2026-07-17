@@ -1,10 +1,13 @@
+use crate::history::{SessionStats, TrendPoint};
 use crate::limits::LimitsSnapshot;
 use crate::menu_format::{format_reset_in, format_tokens, format_usd};
 use crate::model::Agent;
+use crate::records::PersonalRecords;
 use crate::summary::AgentSection;
 use crate::windows::TokenCost;
-use chrono::{DateTime, Local, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Utc};
 use serde::Serialize;
+use std::collections::HashMap;
 
 /// The JSON contract with `ui/panel.html`. Numbers arrive pre-formatted
 /// (Rust owns formatting; the JS only paints). Raw exceptions: bar widths
@@ -28,8 +31,42 @@ pub struct AgentDashboard {
     pub today: StatTile,
     pub month: StatTile,
     pub week: StatTile,
+    /// Pre-rendered 30-day sparkline (inline SVG markup) from the app's own
+    /// history store; empty string when there's fewer than 2 days of
+    /// history to draw a line through.
+    pub trend_svg: String,
+    /// Lines added/removed today, from the statusLine hook (phase 2). Only
+    /// ever `Some` for Claude Code, and only once the user has installed
+    /// that hook and it's sent at least one session — absent otherwise
+    /// (never a false "0" for someone who never installed it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines_today: Option<LinesDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sessions_today: Option<u32>,
+    /// Streak/best-day records (phase 3). Absent only when `history.db`
+    /// itself is unavailable — never a false "0 día" for an agent that
+    /// simply has no history yet (an agent with no events doesn't reach
+    /// the dashboard at all).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub records: Option<RecordsDto>,
     pub by_project: Vec<BreakdownRow>,
     pub by_model: Vec<BreakdownRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LinesDelta {
+    pub added: u64,
+    pub removed: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordsDto {
+    pub current_streak_days: u32,
+    pub longest_streak_days: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_day: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_lines_day: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -59,14 +96,29 @@ pub struct BreakdownRow {
     pub cost: String,
 }
 
-pub fn build_payload(sections: &[AgentSection], now: DateTime<Utc>) -> DashboardPayload {
+pub fn build_payload(
+    sections: &[AgentSection],
+    trends: &HashMap<Agent, Vec<TrendPoint>>,
+    session_stats: &HashMap<Agent, SessionStats>,
+    records_by_agent: &HashMap<Agent, PersonalRecords>,
+    now: DateTime<Utc>,
+) -> DashboardPayload {
     DashboardPayload {
         refreshed_at: clock_in(now, &Local),
-        agents: sections.iter().map(|s| build_agent(s, now)).collect(),
+        agents: sections
+            .iter()
+            .map(|s| build_agent(s, trends, session_stats, records_by_agent, now))
+            .collect(),
     }
 }
 
-fn build_agent(section: &AgentSection, now: DateTime<Utc>) -> AgentDashboard {
+fn build_agent(
+    section: &AgentSection,
+    trends: &HashMap<Agent, Vec<TrendPoint>>,
+    session_stats: &HashMap<Agent, SessionStats>,
+    records_by_agent: &HashMap<Agent, PersonalRecords>,
+    now: DateTime<Utc>,
+) -> AgentDashboard {
     let summary = &section.summary;
     let (id, label) = match summary.agent {
         Agent::ClaudeCode => ("claude_code", "Claude Code"),
@@ -83,6 +135,19 @@ fn build_agent(section: &AgentSection, now: DateTime<Utc>) -> AgentDashboard {
     } else {
         None
     };
+    let stats = session_stats.get(&summary.agent);
+    let records = records_by_agent.get(&summary.agent).map(|r| RecordsDto {
+        current_streak_days: r.current_streak_days,
+        longest_streak_days: r.longest_streak_days,
+        best_day: r
+            .best_day
+            .as_ref()
+            .map(|b| format!("{} · {}", format_tokens(b.tokens), format_short_date(&b.date))),
+        best_lines_day: r
+            .best_lines_day
+            .as_ref()
+            .map(|b| format!("+{} · {}", b.lines_added, format_short_date(&b.date))),
+    });
     AgentDashboard {
         id,
         label,
@@ -91,6 +156,10 @@ fn build_agent(section: &AgentSection, now: DateTime<Utc>) -> AgentDashboard {
         today: tile(&summary.today),
         month: tile(&summary.month),
         week: tile(&summary.last_7_days),
+        trend_svg: trends.get(&summary.agent).map(|p| render_trend_svg(p)).unwrap_or_default(),
+        lines_today: stats.map(|s| LinesDelta { added: s.lines_added, removed: s.lines_removed }),
+        sessions_today: stats.map(|s| s.sessions),
+        records,
         by_project: summary
             .by_project
             .iter()
@@ -140,6 +209,48 @@ fn tile(cost: &TokenCost) -> StatTile {
     StatTile { tokens: format_tokens(cost.tokens), cost: format_usd(cost.cost) }
 }
 
+/// Renders a 30-day token trend as inline SVG (viewBox 0..100 x 0..24), so
+/// the panel JS stays a dumb paint layer — same principle as every other
+/// pre-formatted field in this payload. `stroke="currentColor"` picks up the
+/// agent's accent color from CSS. Fewer than 2 points means there's no line
+/// to draw, so callers get an empty string (no card renders).
+fn render_trend_svg(points: &[TrendPoint]) -> String {
+    if points.len() < 2 {
+        return String::new();
+    }
+    let max_tokens = points.iter().map(|p| p.tokens).max().unwrap_or(0);
+    if max_tokens == 0 {
+        return String::new();
+    }
+    let step = 100.0 / (points.len() - 1) as f64;
+    let coords: Vec<String> = points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let x = i as f64 * step;
+            let y = 23.0 - (p.tokens as f64 / max_tokens as f64) * 22.0;
+            format!("{x:.1},{y:.1}")
+        })
+        .collect();
+    format!(
+        r#"<svg viewBox="0 0 100 24" preserveAspectRatio="none" class="sparkline"><polyline points="{}" fill="none" stroke="currentColor" stroke-width="2" vector-effect="non-scaling-stroke"/></svg>"#,
+        coords.join(" ")
+    )
+}
+
+const SPANISH_MONTHS: [&str; 12] =
+    ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+
+/// "2026-07-10" -> "10 jul". Falls back to the raw string on anything
+/// unparseable (shouldn't happen — these dates only ever come from
+/// `history.rs`, which writes them itself).
+fn format_short_date(date: &str) -> String {
+    match NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(d) => format!("{} {}", d.day(), SPANISH_MONTHS[d.month0() as usize]),
+        Err(_) => date.to_string(),
+    }
+}
+
 fn clock_in<Tz: TimeZone>(t: DateTime<Utc>, tz: &Tz) -> String
 where
     Tz::Offset: std::fmt::Display,
@@ -159,6 +270,18 @@ mod tests {
 
     fn now() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap()
+    }
+
+    fn no_trends() -> HashMap<Agent, Vec<TrendPoint>> {
+        HashMap::new()
+    }
+
+    fn no_sessions() -> HashMap<Agent, SessionStats> {
+        HashMap::new()
+    }
+
+    fn no_records() -> HashMap<Agent, PersonalRecords> {
+        HashMap::new()
     }
 
     fn section(agent: Agent, limits: Option<LimitsSnapshot>) -> AgentSection {
@@ -186,7 +309,8 @@ mod tests {
             )),
             seven_day: Some(RateWindow::new(34.0, None)),
         };
-        let payload = build_payload(&[section(Agent::ClaudeCode, Some(limits))], now());
+        let payload =
+            build_payload(&[section(Agent::ClaudeCode, Some(limits))], &no_trends(), &no_sessions(), &no_records(), now());
         assert_eq!(payload.agents.len(), 1);
         let agent = &payload.agents[0];
         assert_eq!(agent.id, "claude_code");
@@ -209,7 +333,7 @@ mod tests {
 
     #[test]
     fn no_limits_yields_estimated_block_from_active_5h_block() {
-        let payload = build_payload(&[section(Agent::ClaudeCode, None)], now());
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &no_trends(), &no_sessions(), &no_records(), now());
         let agent = &payload.agents[0];
         assert!(agent.limits.is_none());
         // The fixture event is at `now`, so a 5h block is active.
@@ -219,7 +343,7 @@ mod tests {
 
     #[test]
     fn opencode_has_no_limits_and_no_estimated_block() {
-        let payload = build_payload(&[section(Agent::OpenCode, None)], now());
+        let payload = build_payload(&[section(Agent::OpenCode, None)], &no_trends(), &no_sessions(), &no_records(), now());
         let agent = &payload.agents[0];
         assert_eq!(agent.id, "opencode");
         assert_eq!(agent.label, "opencode");
@@ -229,7 +353,7 @@ mod tests {
 
     #[test]
     fn empty_sections_yield_empty_agents() {
-        let payload = build_payload(&[], now());
+        let payload = build_payload(&[], &no_trends(), &no_sessions(), &no_records(), now());
         assert!(payload.agents.is_empty());
     }
 
@@ -239,7 +363,8 @@ mod tests {
             five_hour: Some(RateWindow::new(62.0, None)),
             seven_day: None,
         };
-        let payload = build_payload(&[section(Agent::ClaudeCode, Some(limits))], now());
+        let payload =
+            build_payload(&[section(Agent::ClaudeCode, Some(limits))], &no_trends(), &no_sessions(), &no_records(), now());
         let json = serde_json::to_value(&payload).unwrap();
         assert!(json["refreshed_at"].is_string());
         let agent = &json["agents"][0];
@@ -249,8 +374,117 @@ mod tests {
         assert!(agent.get("estimated_block").is_none()); // absent when None
         assert!(agent["today"]["tokens"].is_string());
         assert!(agent["today"]["cost"].is_string());
+        assert!(agent["trend_svg"].is_string());
         assert!(agent["by_project"][0]["name"].is_string());
         assert!(agent["by_model"][0]["tokens"].is_string());
+    }
+
+    #[test]
+    fn no_trend_history_yields_empty_svg() {
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &no_trends(), &no_sessions(), &no_records(), now());
+        assert_eq!(payload.agents[0].trend_svg, "");
+    }
+
+    #[test]
+    fn single_trend_point_yields_empty_svg() {
+        let mut trends = HashMap::new();
+        trends.insert(
+            Agent::ClaudeCode,
+            vec![TrendPoint { date: "2026-07-15".into(), tokens: 100, cost: 1.0 }],
+        );
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &trends, &no_sessions(), &no_records(), now());
+        assert_eq!(payload.agents[0].trend_svg, "");
+    }
+
+    #[test]
+    fn two_or_more_trend_points_render_a_polyline() {
+        let mut trends = HashMap::new();
+        trends.insert(
+            Agent::ClaudeCode,
+            vec![
+                TrendPoint { date: "2026-07-14".into(), tokens: 100, cost: 1.0 },
+                TrendPoint { date: "2026-07-15".into(), tokens: 400, cost: 4.0 },
+            ],
+        );
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &trends, &no_sessions(), &no_records(), now());
+        let svg = &payload.agents[0].trend_svg;
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains("<polyline"));
+    }
+
+    #[test]
+    fn no_session_data_yields_absent_lines_and_sessions() {
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &no_trends(), &no_sessions(), &no_records(), now());
+        assert!(payload.agents[0].lines_today.is_none());
+        assert!(payload.agents[0].sessions_today.is_none());
+        let json = serde_json::to_value(&payload).unwrap();
+        assert!(json["agents"][0].get("lines_today").is_none()); // absent, not null
+    }
+
+    #[test]
+    fn session_stats_populate_lines_and_sessions_today() {
+        let mut stats = HashMap::new();
+        stats.insert(Agent::ClaudeCode, SessionStats { sessions: 3, lines_added: 58, lines_removed: 12 });
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &no_trends(), &stats, &no_records(), now());
+        let agent = &payload.agents[0];
+        assert_eq!(agent.sessions_today, Some(3));
+        let lines = agent.lines_today.as_ref().unwrap();
+        assert_eq!(lines.added, 58);
+        assert_eq!(lines.removed, 12);
+    }
+
+    #[test]
+    fn no_history_db_yields_absent_records() {
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &no_trends(), &no_sessions(), &no_records(), now());
+        assert!(payload.agents[0].records.is_none());
+        let json = serde_json::to_value(&payload).unwrap();
+        assert!(json["agents"][0].get("records").is_none()); // absent, not null
+    }
+
+    #[test]
+    fn records_are_formatted_with_short_spanish_dates() {
+        use crate::records::{BestDay, BestLinesDay};
+        let mut records = HashMap::new();
+        records.insert(
+            Agent::ClaudeCode,
+            PersonalRecords {
+                current_streak_days: 5,
+                longest_streak_days: 12,
+                best_day: Some(BestDay { date: "2026-07-10".into(), tokens: 3_200_000 }),
+                best_lines_day: Some(BestLinesDay { date: "2026-07-12".into(), lines_added: 420 }),
+            },
+        );
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &no_trends(), &no_sessions(), &records, now());
+        let dto = payload.agents[0].records.as_ref().unwrap();
+        assert_eq!(dto.current_streak_days, 5);
+        assert_eq!(dto.longest_streak_days, 12);
+        assert_eq!(dto.best_day.as_deref(), Some("3.2M tok · 10 jul"));
+        assert_eq!(dto.best_lines_day.as_deref(), Some("+420 · 12 jul"));
+    }
+
+    #[test]
+    fn records_without_best_lines_day_omit_it() {
+        let mut records = HashMap::new();
+        records.insert(
+            Agent::ClaudeCode,
+            PersonalRecords {
+                current_streak_days: 1,
+                longest_streak_days: 1,
+                best_day: None,
+                best_lines_day: None,
+            },
+        );
+        let payload = build_payload(&[section(Agent::ClaudeCode, None)], &no_trends(), &no_sessions(), &records, now());
+        let dto = payload.agents[0].records.as_ref().unwrap();
+        assert!(dto.best_day.is_none());
+        assert!(dto.best_lines_day.is_none());
+    }
+
+    #[test]
+    fn format_short_date_uses_spanish_month_abbreviations() {
+        assert_eq!(format_short_date("2026-07-10"), "10 jul");
+        assert_eq!(format_short_date("2026-01-01"), "1 ene");
+        assert_eq!(format_short_date("not-a-date"), "not-a-date");
     }
 
     #[test]

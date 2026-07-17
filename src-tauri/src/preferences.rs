@@ -12,6 +12,17 @@ pub struct Preferences {
     /// environment supports appindicator labels).
     #[serde(default = "default_show_tray_metric")]
     pub show_tray_metric: bool,
+    /// Whether this app installed a `statusLine.command` into
+    /// `~/.claude/settings.json`. Set only by `install_statusline_cmd`,
+    /// cleared only by `uninstall_statusline_cmd` — never inferred by
+    /// re-reading that file on startup.
+    #[serde(default)]
+    pub statusline_installed: bool,
+    /// The exact command string this app wrote, so an uninstall (or a
+    /// reinstall after the binary moved) can tell whether the current
+    /// `statusLine.command` still matches what we installed.
+    #[serde(default)]
+    pub statusline_installed_command: Option<String>,
 }
 
 fn default_show_tray_metric() -> bool {
@@ -27,6 +38,8 @@ impl Default for Preferences {
             refresh_interval_secs: 60,
             network_pricing_refresh_enabled: true,
             show_tray_metric: true,
+            statusline_installed: false,
+            statusline_installed_command: None,
         }
     }
 }
@@ -69,6 +82,8 @@ mod tests {
             refresh_interval_secs: 30,
             network_pricing_refresh_enabled: false,
             show_tray_metric: false,
+            statusline_installed: true,
+            statusline_installed_command: Some("\"/opt/ai-usage-tray\" --statusline".into()),
         };
         save(dir.path(), &prefs).unwrap();
         let loaded = load(dir.path());

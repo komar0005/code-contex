@@ -117,6 +117,13 @@
     td.name { color: var(--text); max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     td.num { text-align: right; color: var(--muted); padding-left: 10px; white-space: nowrap; }
 
+    .trend .sparkline { width: 100%; height: 32px; display: block; color: var(--accent); }
+
+    .lines-row { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .lines-row .added { color: var(--green); }
+    .lines-row .removed { color: var(--red); margin-left: 8px; }
+    .lines-row .sessions { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 8px; }
+
     .empty { text-align: center; color: var(--muted); padding: 40px 20px; }
 
     footer {
@@ -169,6 +176,14 @@
     #saveStatus { text-align: center; font-size: 12px; color: var(--green); height: 15px; }
     #saveStatus.error { color: var(--red); }
     .back-btn { align-self: flex-start; }
+
+    .hint { font-size: 12px; color: var(--muted); line-height: 1.4; word-break: break-all; }
+    .btn-row { display: flex; gap: 8px; margin-top: 8px; }
+    .btn-row .save-btn { padding: 7px; font-size: 12px; }
+    .btn-row .save-btn.secondary {
+      background: rgba(255, 255, 255, 0.06);
+      border-color: var(--card-border);
+    }
   </style>
 </head>
 <body>
@@ -201,6 +216,14 @@
           <h4>Estado de precios</h4>
           <div class="status-line"><span>Última actualización</span><b id="lastPricingUpdate">—</b></div>
           <div class="status-line"><span>Eventos sin costo este mes</span><b id="unpricedCount">—</b></div>
+        </div>
+        <div class="card" id="statuslineCard">
+          <h4>Integración con la terminal (statusLine)</h4>
+          <p class="hint" id="statuslineDesc">Cargando…</p>
+          <div class="btn-row">
+            <button class="save-btn" id="statuslineInstallBtn">Instalar</button>
+            <button class="save-btn secondary" id="statuslineUninstallBtn" hidden>Desinstalar</button>
+          </div>
         </div>
         <button class="save-btn" id="saveBtn">Guardar</button>
         <div id="saveStatus"></div>
@@ -276,6 +299,20 @@
       </div>`;
     }
 
+    function recordsCard(records) {
+      if (!records) return "";
+      const day = (n) => `${n} día${n === 1 ? "" : "s"}`;
+      let rows = `<div class="status-line"><span>🔥 Racha actual</span><b>${day(records.current_streak_days)}</b></div>`;
+      rows += `<div class="status-line"><span>🏆 Racha más larga</span><b>${day(records.longest_streak_days)}</b></div>`;
+      if (records.best_day) {
+        rows += `<div class="status-line"><span>📈 Mejor día</span><b>${records.best_day}</b></div>`;
+      }
+      if (records.best_lines_day) {
+        rows += `<div class="status-line"><span>✍️ Mejor día (líneas)</span><b>${records.best_lines_day}</b></div>`;
+      }
+      return `<div class="card"><h4>Récords personales</h4>${rows}</div>`;
+    }
+
     function breakdownCard(title, rows) {
       if (!rows.length) return "";
       const body = rows
@@ -315,6 +352,19 @@
       html += `<div class="tiles">
         ${tile("Hoy", agent.today)}${tile("Mes", agent.month)}${tile("7 días", agent.week)}
       </div>`;
+      if (agent.trend_svg) {
+        html += `<div class="card trend"><h4>Últimos 30 días</h4>${agent.trend_svg}</div>`;
+      }
+      if (agent.lines_today) {
+        const sessions =
+          agent.sessions_today != null
+            ? `<span class="sessions">· ${agent.sessions_today} ${agent.sessions_today === 1 ? "sesión" : "sesiones"} hoy</span>`
+            : "";
+        html += `<div class="card"><h4>Líneas hoy</h4>
+          <div class="lines-row"><span class="added">+${agent.lines_today.added}</span><span class="removed">-${agent.lines_today.removed}</span>${sessions}</div>
+        </div>`;
+      }
+      html += recordsCard(agent.records);
       html += breakdownCard("Por proyecto", agent.by_project);
       html += breakdownCard("Por modelo", agent.by_model);
       content.innerHTML = html;
@@ -348,8 +398,72 @@
           })
         : "nunca";
       $("unpricedCount").textContent = status.unpriced_count;
+      await refreshStatuslineCard();
       $("view-dashboard").hidden = true;
       $("view-settings").hidden = false;
+    }
+
+    // ---- statusLine integration (Ajustes card) ----
+    async function refreshStatuslineCard() {
+      try {
+        const status = await invoke("check_statusline_cmd");
+        renderStatuslineCard(status);
+      } catch (e) {
+        renderStatuslineCard({ state: "error", message: String(e) });
+      }
+    }
+
+    function renderStatuslineCard(status) {
+      const desc = $("statuslineDesc");
+      const installBtn = $("statuslineInstallBtn");
+      const uninstallBtn = $("statuslineUninstallBtn");
+      installBtn.hidden = false;
+      uninstallBtn.hidden = true;
+      if (status.state === "ours") {
+        desc.textContent = "Instalada por esta app.";
+        installBtn.textContent = "Reinstalar";
+        uninstallBtn.hidden = false;
+      } else if (status.state === "foreign") {
+        desc.textContent = `Ya tenés otra configurada: ${status.command}`;
+        installBtn.textContent = "Reemplazar";
+      } else if (status.state === "not_configured") {
+        desc.textContent = "Mostrá tus límites y costo del día directamente en la terminal de Claude Code.";
+        installBtn.textContent = "Instalar";
+      } else {
+        desc.textContent = "No se pudo leer la configuración de Claude Code.";
+        installBtn.hidden = true;
+      }
+    }
+
+    async function installStatusline() {
+      let status;
+      try {
+        status = await invoke("check_statusline_cmd");
+      } catch (e) {
+        alert("No se pudo leer la configuración de Claude Code: " + e);
+        return;
+      }
+      const question =
+        status.state === "foreign"
+          ? `Ya tenés configurada otra statusLine:\n${status.command}\n\n¿Reemplazarla por la de esta app? Esto edita ~/.claude/settings.json.`
+          : "¿Instalar la integración con la statusLine de Claude Code? Esto edita ~/.claude/settings.json (solo esa clave).";
+      if (!confirm(question)) return;
+      try {
+        await invoke("install_statusline_cmd");
+        await refreshStatuslineCard();
+      } catch (e) {
+        alert("No se pudo instalar: " + e);
+      }
+    }
+
+    async function uninstallStatusline() {
+      if (!confirm("¿Quitar la integración con la statusLine de Claude Code?")) return;
+      try {
+        await invoke("uninstall_statusline_cmd");
+        await refreshStatuslineCard();
+      } catch (e) {
+        alert("No se pudo quitar: " + e);
+      }
     }
 
     function closeSettings() {
@@ -382,6 +496,8 @@
     $("settingsBtn").addEventListener("click", openSettings);
     $("backBtn").addEventListener("click", closeSettings);
     $("saveBtn").addEventListener("click", saveSettings);
+    $("statuslineInstallBtn").addEventListener("click", installStatusline);
+    $("statuslineUninstallBtn").addEventListener("click", uninstallStatusline);
 
     listen("dashboard-updated", (event) => {
       payload = event.payload;
