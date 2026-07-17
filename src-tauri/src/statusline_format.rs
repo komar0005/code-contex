@@ -33,6 +33,66 @@ fn bar(pct: f64) -> String {
     )
 }
 
+/// Datos ya extraídos para pintar el status line. La capa IO
+/// (statusline.rs) construye esto; aquí solo se formatea.
+pub struct StatuslineRender<'a> {
+    pub branch: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub context_pct: Option<f64>,
+    pub five_hour_pct: Option<f64>,
+    pub seven_day_pct: Option<f64>,
+    /// tray_title del snapshot ("5h 62% · 7d 34%"); solo se usa si no hay
+    /// límites del stdin.
+    pub fallback_limits_text: Option<&'a str>,
+    pub today_cost: Option<&'a str>,
+}
+
+/// "label ▰▰▰▱▱▱▱▱▱▱ 34%" — label en muted, barra y % por nivel.
+fn gauge(label: &str, pct: f64) -> String {
+    format!("{MUTED}{label}{RESET} {} {}{pct:.0}%{RESET}", bar(pct), level_color(pct))
+}
+
+/// Línea 1: sesión (rama, modelo, contexto). Línea 2: cuenta (límites,
+/// gasto de hoy). Segmento ausente → se omite; línea vacía → no se
+/// imprime; nada → cadena vacía.
+pub fn render(r: &StatuslineRender) -> String {
+    let sep = format!("{MUTED} · {RESET}");
+
+    let mut session: Vec<String> = Vec::new();
+    if let Some(branch) = r.branch {
+        session.push(format!("{TEXT}🌿 {branch}{RESET}"));
+    }
+    if let Some(model) = r.model {
+        session.push(format!("{ACCENT}{model}{RESET}"));
+    }
+    if let Some(pct) = r.context_pct {
+        session.push(gauge("ctx", pct));
+    }
+
+    let mut account: Vec<String> = Vec::new();
+    if let Some(pct) = r.five_hour_pct {
+        account.push(gauge("5h", pct));
+    }
+    if let Some(pct) = r.seven_day_pct {
+        account.push(gauge("7d", pct));
+    }
+    if account.is_empty() {
+        if let Some(text) = r.fallback_limits_text {
+            account.push(format!("{TEXT}{text}{RESET}"));
+        }
+    }
+    if let Some(cost) = r.today_cost {
+        account.push(format!("{MUTED}hoy{RESET} {TEXT}{cost}{RESET}"));
+    }
+
+    [session, account]
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.join(&sep))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Quita secuencias ANSI `ESC...m` para que los tests comparen el texto.
 #[cfg(test)]
 pub(crate) fn strip_ansi(s: &str) -> String {
@@ -83,5 +143,81 @@ mod tests {
         assert!(b.ends_with(RESET));
         assert!(bar(30.0).starts_with(GREEN));
         assert!(bar(70.0).starts_with(AMBER));
+    }
+
+    fn full() -> StatuslineRender<'static> {
+        StatuslineRender {
+            branch: Some("main"),
+            model: Some("Sonnet 5"),
+            context_pct: Some(41.0),
+            five_hour_pct: Some(62.0),
+            seven_day_pct: Some(34.0),
+            fallback_limits_text: Some("5h 99% · 7d 99%"),
+            today_cost: Some("$4.30"),
+        }
+    }
+
+    #[test]
+    fn render_full_two_lines_ignoring_fallback_when_stdin_limits_present() {
+        assert_eq!(
+            strip_ansi(&render(&full())),
+            "🌿 main · Sonnet 5 · ctx ▰▰▰▰▱▱▱▱▱▱ 41%\n5h ▰▰▰▰▰▰▱▱▱▱ 62% · 7d ▰▰▰▱▱▱▱▱▱▱ 34% · hoy $4.30"
+        );
+    }
+
+    #[test]
+    fn render_uses_fallback_text_when_no_stdin_limits() {
+        let r = StatuslineRender { five_hour_pct: None, seven_day_pct: None, ..full() };
+        assert_eq!(
+            strip_ansi(&render(&r)),
+            "🌿 main · Sonnet 5 · ctx ▰▰▰▰▱▱▱▱▱▱ 41%\n5h 99% · 7d 99% · hoy $4.30"
+        );
+    }
+
+    #[test]
+    fn render_omits_missing_segments_without_leftover_separators() {
+        let r = StatuslineRender {
+            branch: None,
+            context_pct: None,
+            five_hour_pct: None,
+            seven_day_pct: None,
+            fallback_limits_text: None,
+            today_cost: None,
+            ..full()
+        };
+        assert_eq!(strip_ansi(&render(&r)), "Sonnet 5");
+        assert!(!render(&r).contains('\n'));
+    }
+
+    #[test]
+    fn render_line2_alone_when_session_line_is_empty() {
+        let r = StatuslineRender { branch: None, model: None, context_pct: None, ..full() };
+        assert_eq!(
+            strip_ansi(&render(&r)),
+            "5h ▰▰▰▰▰▰▱▱▱▱ 62% · 7d ▰▰▰▱▱▱▱▱▱▱ 34% · hoy $4.30"
+        );
+        assert!(!render(&r).contains('\n'));
+    }
+
+    #[test]
+    fn render_empty_when_nothing_is_known() {
+        let r = StatuslineRender {
+            branch: None,
+            model: None,
+            context_pct: None,
+            five_hour_pct: None,
+            seven_day_pct: None,
+            fallback_limits_text: None,
+            today_cost: None,
+        };
+        assert_eq!(render(&r), "");
+    }
+
+    #[test]
+    fn render_paints_model_accent_and_hot_context_red() {
+        let r = StatuslineRender { context_pct: Some(90.0), ..full() };
+        let out = render(&r);
+        assert!(out.contains(&format!("{ACCENT}Sonnet 5{RESET}")));
+        assert!(out.contains(RED));
     }
 }
