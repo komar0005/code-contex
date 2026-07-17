@@ -2,7 +2,7 @@
 //
 // The `--statusline` runtime mode: Claude Code invokes the binary this way
 // repeatedly (debounced per turn) with session JSON on stdin, and paints
-// our stdout's first line at the bottom of the terminal. This path must
+// each line of our stdout as a row at the bottom of the terminal. This path must
 // NEVER fail loudly, must NEVER call the network or rescan JSONL files,
 // and must return in milliseconds — any of that would degrade the user's
 // actual coding session. Per

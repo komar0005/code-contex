@@ -49,6 +49,7 @@ pub struct StatuslineRender<'a> {
 
 /// "label ▰▰▰▱▱▱▱▱▱▱ 34%" — label en muted, barra y % por nivel.
 fn gauge(label: &str, pct: f64) -> String {
+    let pct = pct.clamp(0.0, 100.0);
     format!("{MUTED}{label}{RESET} {} {}{pct:.0}%{RESET}", bar(pct), level_color(pct))
 }
 
@@ -219,5 +220,20 @@ mod tests {
         let out = render(&r);
         assert!(out.contains(&format!("{ACCENT}Sonnet 5{RESET}")));
         assert!(out.contains(RED));
+    }
+
+    #[test]
+    fn render_partial_stdin_limits_show_available_lane_and_skip_fallback() {
+        let r = StatuslineRender { seven_day_pct: None, ..full() };
+        assert_eq!(
+            strip_ansi(&render(&r)),
+            "🌿 main · Sonnet 5 · ctx ▰▰▰▰▱▱▱▱▱▱ 41%\n5h ▰▰▰▰▰▰▱▱▱▱ 62% · hoy $4.30"
+        );
+    }
+
+    #[test]
+    fn render_clamps_out_of_range_percentages_in_display() {
+        let r = StatuslineRender { context_pct: Some(-5.0), ..full() };
+        assert!(strip_ansi(&render(&r)).contains("ctx ▱▱▱▱▱▱▱▱▱▱ 0%"));
     }
 }
