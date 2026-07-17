@@ -21,6 +21,9 @@ struct StatuslineInput {
     cwd: Option<String>,
     model: Option<ModelInfo>,
     cost: Option<CostInfo>,
+    workspace: Option<WorkspaceInfo>,
+    context_window: Option<ContextWindowInfo>,
+    rate_limits: Option<RateLimitsInfo>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -34,6 +37,27 @@ struct CostInfo {
     total_duration_ms: Option<u64>,
     total_lines_added: Option<u64>,
     total_lines_removed: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct WorkspaceInfo {
+    current_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ContextWindowInfo {
+    used_percentage: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RateLimitsInfo {
+    five_hour: Option<RateLimitWindow>,
+    seven_day: Option<RateLimitWindow>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RateLimitWindow {
+    used_percentage: Option<f64>,
 }
 
 /// Written by the (separately running) tray app on every refresh; read here
@@ -151,6 +175,7 @@ mod tests {
                 total_lines_added: Some(58),
                 total_lines_removed: Some(12),
             }),
+            ..Default::default()
         }
     }
 
@@ -218,5 +243,26 @@ mod tests {
         persist_session(&db_path, &input_with_model("claude-sonnet-5"));
         let conn = history::open(&db_path).unwrap();
         assert!(history::has_any_sessions(&conn, Agent::ClaudeCode));
+    }
+
+    #[test]
+    fn parses_workspace_context_window_and_rate_limits() {
+        let json = r#"{
+            "session_id": "s1",
+            "cwd": "/home/user/p",
+            "model": {"display_name": "Sonnet 5"},
+            "workspace": {"current_dir": "/home/user/p/sub"},
+            "context_window": {"used_percentage": 41.2},
+            "rate_limits": {
+                "five_hour": {"used_percentage": 62.0, "resets_at": 1789000000},
+                "seven_day": {"used_percentage": 34.5}
+            }
+        }"#;
+        let input: StatuslineInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.workspace.unwrap().current_dir.as_deref(), Some("/home/user/p/sub"));
+        assert_eq!(input.context_window.unwrap().used_percentage, Some(41.2));
+        let limits = input.rate_limits.unwrap();
+        assert_eq!(limits.five_hour.unwrap().used_percentage, Some(62.0));
+        assert_eq!(limits.seven_day.unwrap().used_percentage, Some(34.5));
     }
 }
